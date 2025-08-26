@@ -22,6 +22,7 @@ from torch.distributed.tensor.experimental._attention import (
     _RotateMethod,
     context_parallel,
     context_parallel_unshard,
+    PerDocumentHeadTailLoadBalancer,
     set_rotate_method,
 )
 from torch.distributed.tensor.parallel import parallelize_module
@@ -38,7 +39,7 @@ from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_MEM_EFF_ATTENTION,
 )
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_utils import run_tests, skipIfRocm
+from torch.testing._internal.common_utils import run_tests, skipIfRocm, TestCase
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     ModelArgs,
@@ -60,6 +61,43 @@ rotater_enum_to_str = {
     _RotateMethod.ALL_GATHER: "allgather",
     _RotateMethod.ALL_TO_ALL: "alltoall",
 }  # mapping from _RotateMethod enum to string
+
+
+class LoadBalanceTest(TestCase):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @property
+    def device_type(self) -> str:
+        return "cuda"
+
+    @skip_if_lt_x_gpu(1)
+    def test_per_document_headtail_load_balance(self):
+        # In document mask, we apply per-document sharding to the QKV tensor:
+        # chunk 0, N-1 are sharded on rank 0, chunk 1, N-2 are sharded on rank 1, etc.
+
+        # TODO: block size, ... ???
+        batch_size = 2
+        doc_count = 4
+        max_seq_len = 28
+
+        # initialize document mask
+        lengths = [
+            generate_random_lengths_in_chunks(
+                max_seq_len, doc_count, chunk_size=self.world_size * 2
+            )
+            for _ in range(batch_size)
+        ]
+        print(f"lengths={lengths}")
+
+        # instantiate the load balancer object
+        lb = PerDocumentHeadTailLoadBalancer(
+            lengths, self.world_size, torch.device(self.device_type)
+        )
+        indices_per_batch = lb.generate_indices(restore=False)
+
+        print(indices_per_batch)
 
 
 class RingAttentionTest(DTensorTestBase):
@@ -459,7 +497,7 @@ def causal_mask(b, h, q_idx, kv_idx):
 
 
 # copied from https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/masks/document_mask.py
-def generate_random_lengths(total_length, num_documents):
+def generate_random_lengths(total_length, num_documents) -> list[int]:
     # Initialize all lengths to 1 to ensure each document has at least one token
     lengths = [1] * num_documents
     remaining_length = total_length - num_documents
@@ -470,6 +508,26 @@ def generate_random_lengths(total_length, num_documents):
         lengths[index] += 1
 
     return lengths
+
+
+def generate_random_lengths_in_chunks(
+    total_length, num_documents, chunk_size
+) -> list[int]:
+    # Generate a list of random document lengths so that each document contains
+    # some number of chunks of size `chunk_size`. This means each document's length
+    # must be a multiple of `chunk_size`. Besides, the lengths of all the documents
+    # sum up to `total_length`.
+    num_chunks = total_length // chunk_size
+    assert total_length % chunk_size == 0 and num_chunks >= num_documents
+
+    num_chunks_per_document = [1] * num_documents
+    remaining_chunks = num_chunks - num_documents
+    # Randomly distribute the remaining chunks
+    for _ in range(remaining_chunks):
+        index = random.randint(0, num_documents - 1)  # document_id
+        num_chunks_per_document[index] += 1
+
+    return [num_chunks * chunk_size for num_chunks in num_chunks_per_document]
 
 
 def length_to_offsets(
@@ -539,6 +597,8 @@ class RingFlexAttentionTest(DTensorTestBase):
     def _test_ring_flex_attention(
         self, qkv_size, B=1, mask_func=causal_mask, atol=1e-6, rtol=1e-2
     ) -> None:
+        enable_load_balance = True
+
         torch.cuda.manual_seed(10)
         dtype = torch.float32
         bs = B if B > 1 else 8
@@ -595,9 +655,6 @@ class RingFlexAttentionTest(DTensorTestBase):
             2,
         )
 
-        # NOTE: we do not test load balance here
-        _cp_options.enable_load_balance = False
-
         # set CP context dispatch mode to use TORCH_FUNCTION for flex_attention
         torch.distributed.tensor.experimental._attention._dispatch_mode = (
             _DispatchMode.TORCH_FUNCTION
@@ -612,6 +669,8 @@ class RingFlexAttentionTest(DTensorTestBase):
         from torch.distributed.tensor.experimental._attention import (
             create_cp_block_mask,
         )
+
+        # if load-balance is enabled, reorder input tensor and produce the index tensor
 
         # NOTE: call create_block_mask() within TorchFunctionMode would cause error in create_fw_bw_graph
         cp_block_mask = create_cp_block_mask(
@@ -684,6 +743,9 @@ class RingFlexAttentionTest(DTensorTestBase):
             self._test_ring_flex_attention,
         )
 
+        # NOTE: we do not test load balance here
+        _cp_options.enable_load_balance = False
+
         # NOTE: Context Parallel should not be used for small attentions (block_size < 128)
         with self.assertRaisesRegex(AssertionError, "Tensor-likes are not close"):
             self.run_subtests(
@@ -704,8 +766,9 @@ class RingFlexAttentionTest(DTensorTestBase):
         # test case.
         torch._dynamo.config.cache_size_limit = 12
 
-        # initialize document mask
+        # parameters for testing
         doc_count = 28
+        enable_load_balance_list = [True, False]
         batch_size_list = [2, 4, 8]
         max_seq_len_list = [
             256 * self.world_size,
@@ -717,15 +780,19 @@ class RingFlexAttentionTest(DTensorTestBase):
         # Use a for-loop instead of run_subtests because we need to intialize the mask
         # for each subtest. This can be baked into self._test_ring_flex_attention as
         # a str argument denoting mask type.
-        for batch_size, max_seq_len in itertools.product(
-            batch_size_list, max_seq_len_list
+        for enable_load_balance, batch_size, max_seq_len in itertools.product(
+            enable_load_balance_list, batch_size_list, max_seq_len_list
         ):
+            # initialize document mask
             lengths = [
                 generate_random_lengths(max_seq_len, doc_count)
                 for _ in range(batch_size)
             ]
             offsets = length_to_offsets(lengths, self.device_type)
             document_causal_mask = generate_doc_mask_mod(causal_mask, offsets)
+
+            _cp_options.enable_load_balance = enable_load_balance
+            # generate
 
             # construct testing function
             test_func = functools.partial(
