@@ -1681,7 +1681,6 @@ class ScaledTMAConfigMixin(ScaledMMConfigMixin):
 # Template-specific heuristic classes using multiple inheritance
 
 
-# TODO(coconutruben): replace with template.name once templates are importable
 @register_template_heuristic(
     mm_template.uid,
     "cuda",
@@ -1697,7 +1696,12 @@ class CUDAMMTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
 
 
 # TODO(coconutruben): deprecate once autoheuristic is deprecated
-@register_template_heuristic("mm-ah", "cuda", register=torch.version.hip is None)
+@register_template_heuristic(
+    mm_template.uid,
+    "cuda",
+    register=torch.version.hip is None,
+    op_name="mm-ah",
+)
 class CUDAMMAHTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
     """Standard MM template heuristic for CUDA using the extra mm configs only (for autoheuristic)"""
 
