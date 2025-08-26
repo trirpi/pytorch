@@ -3,11 +3,13 @@ from collections import defaultdict
 
 import torch
 from torch.export.unflatten import _ModuleFrame, _SubmoduleEntry
+from torch.export._unlift import GuardsFn
 
 
 def _outline_submodules(orig_graph: torch.fx.Graph) -> torch.fx.GraphModule:
     # Create an empty GraphModule to hold the outlined modules
     new_module = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+    new_module._guards_fn = GuardsFn()
     seen_nodes: dict[str, torch.fx.Node] = {}
     seen_modules: dict[int, list[_SubmoduleEntry]] = defaultdict(list)
     seen_attrs: dict[str, set[str]] = defaultdict(set)
